@@ -265,7 +265,6 @@ class Receiver:
         if seq > self.next_expected:
             if seq - self.next_expected < self.window():
                 self.ooo[seq] = length
-            self.next_expected = end
             return self.next_expected
         self.next_expected = end
         self.unread += length
@@ -428,7 +427,7 @@ class RenoConnection:
         """React to an acknowledgement that repeats the last one."""
         self.stats["duplicate_acks"] += 1
         self.dup_acks += 1
-        if self.dup_acks > DUP_ACK_THRESHOLD:
+        if self.dup_acks >= DUP_ACK_THRESHOLD:
             if self.fast_recovery:
                 self.cwnd += self.mss
             else:
@@ -441,7 +440,7 @@ class RenoConnection:
         acknowledged = [segment for segment in self.outstanding if segment.end <= ack]
         self.outstanding = [segment for segment in self.outstanding if segment.end > ack]
         for segment in acknowledged:
-            if segment.end == ack:
+            if segment.end == ack and not segment.retransmitted:
                 self._update_rtt(segment)
         self.dup_acks = 0
         if self.fast_recovery:
@@ -472,7 +471,7 @@ class RenoConnection:
     def _enter_fast_recovery(self) -> None:
         """React to enough duplicate acknowledgements with a retransmission."""
         self.ssthresh = max(self.flight_size() // 2, 2 * self.mss)
-        self.cwnd = self.ssthresh
+        self.cwnd = self.ssthresh + 3 * self.mss
         self.fast_recovery = True
         self.stats["fast_retransmits"] += 1
         self._retransmit_oldest()
@@ -485,7 +484,7 @@ class RenoConnection:
         if not self.outstanding:
             return False
         self.stats["timeouts"] += 1
-        self.ssthresh = self.cwnd // 2
+        self.ssthresh = max(self.cwnd // 2, 2 * self.mss)
         self.cwnd = self.mss
         self.fast_recovery = False
         self.dup_acks = 0
@@ -506,7 +505,7 @@ class RenoConnection:
 
     def _back_off_rto(self) -> float:
         """Widen the retransmission timeout after it has expired."""
-        self.rto = self.rto * 2
+        self.rto = min(self.rto * 2, MAX_RTO)
         return self.rto
 
     # -- timers -------------------------------------------------------------
@@ -527,14 +526,14 @@ class RenoConnection:
         """Follow the acknowledgement with the retransmission timer."""
         if not self.outstanding:
             self._disarm_timer()
-        elif self.timer_deadline is None:
+        else:
             self._arm_timer()
 
     def _persist_blocked(self) -> bool:
         """Whether a closed peer window is what keeps the send buffer from moving."""
         if self.outstanding or self._unsent <= 0:
             return False
-        return self.usable_window() < 0
+        return self.rwnd <= 0
 
     def _arm_persist(self) -> Optional[float]:
         """Start the persist timer if it is not already running."""
